@@ -13,13 +13,16 @@ WhisperProcessor::WhisperProcessor(const std::string& model_path,
                                    std::condition_variable& buffer_cv,
                                    std::atomic<bool>& stop_flag,
                                    DocumentFormatter& formatter)
-    : m_model_path(model_path), m_whisper_ctx(nullptr), // m_whisper_state removed
+    : m_model_path(model_path), m_whisper_ctx(nullptr),
       m_shared_audio_buffer_ref(shared_audio_buffer),
       m_buffer_mutex_ref(buffer_mutex),
       m_buffer_cv_ref(buffer_cv),
       m_stop_flag_ref(stop_flag),
       m_formatter_ref(formatter),
-      m_first_transcription_run(true) {}
+      m_previous_chunk_full_text_for_dedup(""),
+      m_first_transcription_run(true) {
+    m_last_activity_time.store(std::chrono::steady_clock::now());
+}
 
 WhisperProcessor::~WhisperProcessor() {
     if (m_worker_thread.joinable()) {
@@ -27,7 +30,6 @@ WhisperProcessor::~WhisperProcessor() {
         m_buffer_cv_ref.notify_all();
         m_worker_thread.join();
     }
-    // if (m_whisper_state) { whisper_free_state(m_whisper_state); m_whisper_state = nullptr; } // Removed
     if (m_whisper_ctx) { whisper_free(m_whisper_ctx); m_whisper_ctx = nullptr; }
 }
 
@@ -45,13 +47,11 @@ bool WhisperProcessor::initialize_whisper() {
         std::cerr << "WhisperProcessor: Failed to load model from " << m_model_path << std::endl;
         return false;
     }
-    // m_whisper_state = whisper_init_state(m_whisper_ctx); // Removed
-    // if (!m_whisper_state) { /* ... error handling ... */ } // Removed
     return true;
 }
 
 void WhisperProcessor::start_processing_thread() {
-    if (!m_whisper_ctx) { // Removed m_whisper_state check
+    if (!m_whisper_ctx) {
         std::cerr << "WhisperProcessor: Whisper context not initialized. Cannot start thread." << std::endl;
         return;
     }
@@ -72,34 +72,41 @@ std::vector<float> WhisperProcessor::resample_audio(const std::vector<float>& in
     src_data.output_frames = static_cast<long>(output.size());
     src_data.src_ratio = ratio;
     src_data.end_of_input = 1;
-    if (src_simple(&src_data, SRC_SINC_FASTEST, 1) != 0) return {};
+    int err = src_simple(&src_data, SRC_SINC_FASTEST, 1);
+    if (err != 0) {
+        std::cerr << "WhisperProcessor: Libsamplerate error: " << src_strerror(err) << std::endl;
+        return {};
+    }
     output.resize(src_data.output_frames_gen);
     return output;
 }
 
+std::chrono::steady_clock::time_point WhisperProcessor::get_last_activity_time() const {
+    return m_last_activity_time.load(std::memory_order_acquire);
+}
+
 void WhisperProcessor::processing_loop() {
     std::vector<float> chunk_to_process_raw;
-    std::string previous_chunk_full_text = ""; // Simple de-duplication for full chunk repeats
 
     while (!m_stop_flag_ref.load(std::memory_order_relaxed)) {
         chunk_to_process_raw.clear();
         {
             std::unique_lock<std::mutex> lock(m_buffer_mutex_ref);
-            m_buffer_cv_ref.wait_for(lock, std::chrono::milliseconds(200), [&]{ // Timeout to check stop_flag
+            m_buffer_cv_ref.wait_for(lock, std::chrono::milliseconds(200), [&]{
                 return (m_shared_audio_buffer_ref.size() >= WP_CHUNK_PROCESSING_SAMPLES_RAW) ||
                        m_stop_flag_ref.load(std::memory_order_relaxed);
             });
 
             if (m_stop_flag_ref.load(std::memory_order_relaxed)) {
-                if (m_shared_audio_buffer_ref.size() >= WP_MIN_SAMPLES_IN_BUFFER_FOR_LOOP) { // Process final chunk if decent size
+                if (m_shared_audio_buffer_ref.size() >= WP_MIN_SAMPLES_FOR_FINAL_CHUNK_RAW) {
                     chunk_to_process_raw.assign(m_shared_audio_buffer_ref.begin(), m_shared_audio_buffer_ref.end());
                     m_shared_audio_buffer_ref.clear();
                 } else {
-                    break; // Stop and buffer is too small or empty
+                    break;
                 }
             } else if (m_shared_audio_buffer_ref.size() >= WP_CHUNK_PROCESSING_SAMPLES_RAW) {
                 chunk_to_process_raw.assign(m_shared_audio_buffer_ref.begin(), m_shared_audio_buffer_ref.begin() + WP_CHUNK_PROCESSING_SAMPLES_RAW);
-                m_shared_audio_buffer_ref.erase(m_shared_audio_buffer_ref.begin(), m_shared_audio_buffer_ref.begin() + WP_CHUNK_PROCESSING_SAMPLES_RAW); // Non-overlapping chunks
+                m_shared_audio_buffer_ref.erase(m_shared_audio_buffer_ref.begin(), m_shared_audio_buffer_ref.begin() + WP_CHUNK_PROCESSING_SAMPLES_RAW);
             } else {
                 continue;
             }
@@ -110,17 +117,18 @@ void WhisperProcessor::processing_loop() {
             continue;
         }
 
+        m_last_activity_time.store(std::chrono::steady_clock::now());
         std::vector<float> resampled_chunk = resample_audio(chunk_to_process_raw);
         if (resampled_chunk.empty()) continue;
 
         whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-        params.language = "en";
-        params.suppress_blank = true;
-        params.print_realtime = false;
-        params.print_progress = false;
-        params.no_timestamps = true; // Can be true if not using timestamps for de-dupe
+        params.language         = "en";
+        params.suppress_blank   = true;
+        params.print_realtime   = false;
+        params.print_progress   = false;
+        params.no_timestamps    = true;
 
-        int stt_result = whisper_full(m_whisper_ctx, params, resampled_chunk.data(), resampled_chunk.size()); // Using whisper_full
+        int stt_result = whisper_full(m_whisper_ctx, params, resampled_chunk.data(), resampled_chunk.size());
 
         if (stt_result == 0) {
             int n_segments = whisper_full_n_segments(m_whisper_ctx);
@@ -132,15 +140,16 @@ void WhisperProcessor::processing_loop() {
                     const char* text_cstr = whisper_full_get_segment_text(m_whisper_ctx, i);
                     if (text_cstr) {
                         std::string segment = std::string(text_cstr);
-                        if(!current_chunk_text_combined.empty() && !segment.empty() && segment.front() != ' ') current_chunk_text_combined += " ";
+                        if(!current_chunk_text_combined.empty() && !segment.empty() && segment.front() != ' ' && current_chunk_text_combined.back() != ' ') {
+                             current_chunk_text_combined += " ";
+                        }
                         current_chunk_text_combined += segment;
                     }
                 }
             }
             current_chunk_text_combined = cleanup_stt_artifacts_util(current_chunk_text_combined);
 
-            // Very simple de-duplication: if this whole chunk is same as previous, skip.
-            if (m_first_transcription_run || (previous_chunk_full_text != current_chunk_text_combined && !current_chunk_text_combined.empty())) {
+            if (m_first_transcription_run || (m_previous_chunk_full_text_for_dedup != current_chunk_text_combined && !current_chunk_text_combined.empty())) {
                 if (m_first_transcription_run && !current_chunk_text_combined.empty()) {
                      m_formatter_ref.clear_document();
                      m_first_transcription_run = false;
@@ -148,9 +157,10 @@ void WhisperProcessor::processing_loop() {
                 if (!current_chunk_text_combined.empty()) {
                     m_formatter_ref.process_transcribed_text(current_chunk_text_combined);
                     new_text_this_run = true;
+                    m_last_activity_time.store(std::chrono::steady_clock::now());
                 }
             }
-            previous_chunk_full_text = current_chunk_text_combined;
+            m_previous_chunk_full_text_for_dedup = current_chunk_text_combined;
 
             if (new_text_this_run) {
                 m_formatter_ref.print_current_document_preview();

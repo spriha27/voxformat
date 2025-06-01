@@ -7,34 +7,44 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <filesystem>
 
 #include "audio_capturer.h"
-#include "whisper_processor.h"
+#include "whisper_processor.h" // This will bring in WP_CHUNK_PROCESSING_SECONDS (if it's a macro)
+                              // or WhisperProcessor::CFG_PROCESSING_WINDOW_SECONDS (if static const)
 #include "document_formatter.h"
 #include "text_segment.h"
 
+namespace fs = std::filesystem;
+
 std::vector<float> g_main_shared_audio_buffer;
-std::mutex g_main_buffer_mutex;
+std::mutex g_main_document_and_audio_mutex;
 std::condition_variable g_main_buffer_cv;
 std::atomic<bool> g_main_stop_threads{false};
 
-#define APP_RECORDING_DURATION_SECONDS 30
-#define CFG_PROCESSING_WINDOW_SECONDS 4.0;
+const int SILENCE_TIMEOUT_SECONDS = 30;
+// #define APP_RECORDING_DURATION_SECONDS 30 // No longer used for fixed duration
 
 int main() {
     g_main_stop_threads.store(false);
     DocumentFormatter doc_formatter;
+
     const char* model_path = "../external/whisper.cpp/models/ggml-base.en.bin";
     WhisperProcessor whisper_processor(model_path,
-                                       g_main_shared_audio_buffer, g_main_buffer_mutex,
-                                       g_main_buffer_cv, g_main_stop_threads,
+                                       g_main_shared_audio_buffer,
+                                       g_main_document_and_audio_mutex,
+                                       g_main_buffer_cv,
+                                       g_main_stop_threads,
                                        doc_formatter);
     if (!whisper_processor.initialize_whisper()) {
         std::cerr << "Main: Failed to initialize Whisper. Exiting." << std::endl;
         return 1;
     }
-    AudioCapturer audio_capturer(g_main_shared_audio_buffer, g_main_buffer_mutex,
-                                 g_main_buffer_cv, g_main_stop_threads);
+
+    AudioCapturer audio_capturer(g_main_shared_audio_buffer,
+                                 g_main_document_and_audio_mutex,
+                                 g_main_buffer_cv,
+                                 g_main_stop_threads);
     if (!audio_capturer.initialize()) {
         std::cerr << "Main: Failed to initialize Audio Capturer. Exiting." << std::endl;
         return 1;
@@ -50,34 +60,39 @@ int main() {
     }
 
     std::cout << "Whisper model loaded. VoxFormat ready." << std::endl;
-    // std::cout << "Speak your commands and text. Processing " << CFG_PROCESSING_WINDOW_SECONDS << "s audio chunks." << std::endl;
-    std::cout << "--- Listening... (Recording for " << APP_RECORDING_DURATION_SECONDS << "s or until 'format stop application') ---" << std::endl;
+    // Use the constant defined in whisper_processor.h directly as it's a macro now
+    std::cout << "Speak your commands and text. Processing " << WP_PROCESSING_WINDOW_SECONDS_VAL /* Use the macro directly */ << "s audio chunks." << std::endl;
+    std::cout << "--- Listening... (Application will stop after " << SILENCE_TIMEOUT_SECONDS << "s of silence or by 'format stop application') ---" << std::endl;
 
-    auto recording_start_time = std::chrono::steady_clock::now();
-    while(!g_main_stop_threads.load(std::memory_order_acquire)) { // Check main stop flag
-        // Check if formatter signaled app stop
+    while(true) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        if (g_main_stop_threads.load(std::memory_order_acquire)) {
+             if (doc_formatter.m_should_stop_application.load(std::memory_order_acquire)){
+                 // Message already printed by DocumentFormatter or main loop when command detected
+             } else {
+                 std::cout << "\n--- Main: Stop signal received by main loop. Initiating shutdown... ---" << std::endl;
+             }
+            break;
+        }
+
         if (doc_formatter.m_should_stop_application.load(std::memory_order_acquire)) {
-            std::cout << "\n--- Main: 'format stop application' detected. Signaling stop... ---" << std::endl;
-            g_main_stop_threads.store(true, std::memory_order_release); // Set main stop flag
-            g_main_buffer_cv.notify_all(); // Ensure worker thread wakes up to see it
+            std::cout << "\n--- Main: 'format stop application' detected by formatter. Signaling all threads... ---" << std::endl;
+            g_main_stop_threads.store(true, std::memory_order_release);
+            g_main_buffer_cv.notify_all();
             break;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - recording_start_time).count() >= APP_RECORDING_DURATION_SECONDS) {
-            if(!g_main_stop_threads.load()) {
-                std::cout << "\n--- Main: Recording duration reached. Signaling stop... ---" << std::endl;
-                g_main_stop_threads.store(true, std::memory_order_release);
-                g_main_buffer_cv.notify_all();
-            }
+        auto last_speech_activity = whisper_processor.get_last_activity_time();
+        auto silence_duration = std::chrono::duration_cast<std::chrono::seconds>(now - last_speech_activity);
+
+        if (silence_duration.count() >= SILENCE_TIMEOUT_SECONDS) {
+            std::cout << "\n--- Main: " << SILENCE_TIMEOUT_SECONDS << "s of silence detected. Signaling stop... ---" << std::endl;
+            g_main_stop_threads.store(true, std::memory_order_release);
+            g_main_buffer_cv.notify_all();
             break;
         }
-    }
-    // This redundant propagation is fine, ensures stop if formatter set it but main loop didn't catch it immediately.
-    if (doc_formatter.m_should_stop_application.load() && !g_main_stop_threads.load()) {
-        g_main_stop_threads.store(true, std::memory_order_release);
-        g_main_buffer_cv.notify_all();
     }
 
     audio_capturer.stop_stream();
@@ -85,6 +100,17 @@ int main() {
     if (whisper_processor.is_thread_joinable()) {
         whisper_processor.join_thread();
     }
+
+    fs::path project_run_path = fs::current_path(); // This is cmake-build-debug
+    fs::path project_root_path = project_run_path.parent_path(); // Go up to project root "voxformat"
+    // If you want to be absolutely sure or if build dir is nested differently:
+    // fs::path source_file_dir = fs::path(__FILE__).parent_path(); // Directory of main.cpp
+    // project_root_path = source_file_dir; // Assuming main.cpp is in project root
+
+    fs::path output_dir_path = project_root_path / "outputs";
+    std::string output_file_path_str = (output_dir_path / "output.txt").string();
+
+    doc_formatter.save_document_to_file(output_file_path_str);
 
     std::cout << "Application finished." << std::endl;
     return 0;
