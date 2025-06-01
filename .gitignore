@@ -1,2 +1,24 @@
-cmake-build-debug/
+# CMake build files
+cmake-build-*/
+CMakeUserPresets.json
+*.cbp
+*.cmake.depends
+*.cmake.layout
+*.ninja_log
+*.ninja_deps
+compile_commands.json
+
+# IDE files (CLion)
 .idea/
+
+# macOS specific
+.DS_Store
+
+# Compiled output (if you have an outputs folder for generated files,
+# you might want to ignore its contents or specific patterns if they are purely transient)
+# Example: /outputs/*.txt (if you want to commit the folder but not .txt files)
+# For now, let's assume you want to commit the 'outputs' folder if it's created by save.
+# If 'outputs/output.txt' is a *result* you don't want in version control, add:
+# outputs/output.txt
+# or
+# outputs/

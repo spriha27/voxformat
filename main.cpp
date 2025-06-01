@@ -1,89 +1,91 @@
+// main.cpp
 #include <iostream>
-#include <portaudio.h>
+#include <vector>
+#include <string>
 #include <thread>
 #include <chrono>
-#include <vector>
-#include <cmath>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 
+#include "audio_capturer.h"
+#include "whisper_processor.h"
+#include "document_formatter.h"
 #include "text_segment.h"
-#define SAMPLE_RATE 44100
-std::vector<float> currentSpeechBuffer;
 
-static int recordCallback(const void *inputBuffer, void *outputBuffer,
-                          unsigned long framesPerBuffer,
-                          const PaStreamCallbackTimeInfo *timeInfo,
-                          PaStreamCallbackFlags statusFlags,
-                          void *userData)
-{
-    constexpr float SILENCE_THRESHOLD = 0.02f;
-    constexpr int SILENCE_FRAMES_BEFORE_STOP = 10;
+std::vector<float> g_main_shared_audio_buffer;
+std::mutex g_main_buffer_mutex;
+std::condition_variable g_main_buffer_cv;
+std::atomic<bool> g_main_stop_threads{false};
 
-    static bool isSpeaking = false;
-    static int silenceCounter = 0;
+#define APP_RECORDING_DURATION_SECONDS 30
+#define CFG_PROCESSING_WINDOW_SECONDS 4.0;
 
-    if (!inputBuffer) {
-        std::cout << "[Silence]" << std::endl;
-        silenceCounter++;
-        return paContinue;
+int main() {
+    g_main_stop_threads.store(false);
+    DocumentFormatter doc_formatter;
+    const char* model_path = "../external/whisper.cpp/models/ggml-base.en.bin";
+    WhisperProcessor whisper_processor(model_path,
+                                       g_main_shared_audio_buffer, g_main_buffer_mutex,
+                                       g_main_buffer_cv, g_main_stop_threads,
+                                       doc_formatter);
+    if (!whisper_processor.initialize_whisper()) {
+        std::cerr << "Main: Failed to initialize Whisper. Exiting." << std::endl;
+        return 1;
+    }
+    AudioCapturer audio_capturer(g_main_shared_audio_buffer, g_main_buffer_mutex,
+                                 g_main_buffer_cv, g_main_stop_threads);
+    if (!audio_capturer.initialize()) {
+        std::cerr << "Main: Failed to initialize Audio Capturer. Exiting." << std::endl;
+        return 1;
     }
 
-    const float *in = static_cast<const float *>(inputBuffer);
-    bool voiceDetected = false;
+    whisper_processor.start_processing_thread();
+    if (!audio_capturer.start_stream()) {
+        std::cerr << "Main: Failed to start audio stream. Signaling stop." << std::endl;
+        g_main_stop_threads.store(true);
+        g_main_buffer_cv.notify_all();
+        if(whisper_processor.is_thread_joinable()) whisper_processor.join_thread();
+        return 1;
+    }
 
-    for (unsigned long i = 0; i < framesPerBuffer; ++i) {
-        if (std::fabs(in[i]) > SILENCE_THRESHOLD) {
-            voiceDetected = true;
+    std::cout << "Whisper model loaded. VoxFormat ready." << std::endl;
+    // std::cout << "Speak your commands and text. Processing " << CFG_PROCESSING_WINDOW_SECONDS << "s audio chunks." << std::endl;
+    std::cout << "--- Listening... (Recording for " << APP_RECORDING_DURATION_SECONDS << "s or until 'format stop application') ---" << std::endl;
+
+    auto recording_start_time = std::chrono::steady_clock::now();
+    while(!g_main_stop_threads.load(std::memory_order_acquire)) { // Check main stop flag
+        // Check if formatter signaled app stop
+        if (doc_formatter.m_should_stop_application.load(std::memory_order_acquire)) {
+            std::cout << "\n--- Main: 'format stop application' detected. Signaling stop... ---" << std::endl;
+            g_main_stop_threads.store(true, std::memory_order_release); // Set main stop flag
+            g_main_buffer_cv.notify_all(); // Ensure worker thread wakes up to see it
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - recording_start_time).count() >= APP_RECORDING_DURATION_SECONDS) {
+            if(!g_main_stop_threads.load()) {
+                std::cout << "\n--- Main: Recording duration reached. Signaling stop... ---" << std::endl;
+                g_main_stop_threads.store(true, std::memory_order_release);
+                g_main_buffer_cv.notify_all();
+            }
             break;
         }
     }
-
-    if (voiceDetected) {
-        if (!isSpeaking) {
-            std::cout << "Voice started!" << std::endl;
-            isSpeaking = true;
-        }
-        currentSpeechBuffer.insert(currentSpeechBuffer.end(), in, in + framesPerBuffer);
-        silenceCounter = 0;
-    } else {
-        std::cout << "[Silence]" << std::endl;
-        silenceCounter++;
-        if (isSpeaking && silenceCounter >= SILENCE_FRAMES_BEFORE_STOP) {
-            std::cout << "Voice stopped. Segment complete." << std::endl;
-            isSpeaking = false;
-            std::cout << "Segment collected: " << currentSpeechBuffer.size() << " samples" << std::endl;
-            // TODO: Send currentSpeechBuffer to Whisper.cpp.
-            currentSpeechBuffer.clear();
-            silenceCounter = 0;
-        }
+    // This redundant propagation is fine, ensures stop if formatter set it but main loop didn't catch it immediately.
+    if (doc_formatter.m_should_stop_application.load() && !g_main_stop_threads.load()) {
+        g_main_stop_threads.store(true, std::memory_order_release);
+        g_main_buffer_cv.notify_all();
     }
 
-    return paContinue;
-}
+    audio_capturer.stop_stream();
 
-int main()
-{
-    PaStream *stream;
-    PaError err;
-
-    err = Pa_Initialize();
-    if( err != paNoError )
-        printf(  "PortAudio error: %s\n", Pa_GetErrorText( err ) );
-
-    auto inputDevice = Pa_GetDefaultInputDevice();
-    if (inputDevice == paNoDevice)
-    {
-        std::cout << "No input device found" << std::endl;
-        return 1;
+    if (whisper_processor.is_thread_joinable()) {
+        whisper_processor.join_thread();
     }
-    Pa_OpenDefaultStream(&stream, 1, 0, paFloat32, SAMPLE_RATE, 256, recordCallback, nullptr);
-    Pa_StartStream(stream);
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    Pa_StopStream(stream);
-    Pa_CloseStream(stream);
 
-    err = Pa_Terminate();
-    if( err != paNoError )
-        printf(  "PortAudio error: %s\n", Pa_GetErrorText( err ) );
-
+    std::cout << "Application finished." << std::endl;
     return 0;
 }
