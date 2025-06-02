@@ -29,7 +29,9 @@ int main() {
     g_main_stop_threads.store(false);
     DocumentFormatter doc_formatter;
 
-    const char* model_path = "../external/whisper.cpp/models/ggml-base.en.bin";
+    // const char* model_path = "../external/whisper.cpp/models/ggml-base.en.bin";
+    const char* model_path = "../external/whisper.cpp/models/ggml-small.en.bin";
+    // const char* model_path = "../external/whisper.cpp/models/ggml-medium.en.bin";
     WhisperProcessor whisper_processor(model_path,
                                        g_main_shared_audio_buffer,
                                        g_main_document_and_audio_mutex,
@@ -108,7 +110,7 @@ int main() {
     // project_root_path = source_file_dir; // Assuming main.cpp is in project root
 
     fs::path output_dir_path = project_root_path / "outputs";
-    std::string output_file_path_str = (output_dir_path / "output.txt").string();
+    std::string output_file_path_str = (output_dir_path / "output.md").string();
 
     doc_formatter.save_document_to_file(output_file_path_str);
 

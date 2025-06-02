@@ -17,7 +17,7 @@ echo
 echo "[INFO] Navigating to Whisper.cpp directory to download model..."
 if [ -d "external/whisper.cpp" ]; then
     cd external/whisper.cpp
-    echo "[INFO] Downloading ggml-base.en model for Whisper.cpp..."
+    echo "[INFO] Downloading ggml-small.en model for Whisper.cpp..."
     # Check if models directory exists, if not, the script might create it or be inside it
     if [ -f "./models/download-ggml-model.sh" ]; then
         bash ./models/download-ggml-model.sh base.en
@@ -25,11 +25,11 @@ if [ -d "external/whisper.cpp" ]; then
         bash ./download-ggml-model.sh base.en
     else
         echo "[WARNING] Could not find download-ggml-model.sh in standard locations."
-        echo "          Please download 'ggml-base.en.bin' manually into 'external/whisper.cpp/models/'."
+        echo "          Please download 'ggml-small.en.bin' manually into 'external/whisper.cpp/models/'."
     fi
 
-    if [ -f "./models/ggml-base.en.bin" ]; then
-        echo "[SUCCESS] Whisper model ggml-base.en.bin downloaded."
+    if [ -f "./models/ggml-small.en.bin" ]; then
+        echo "[SUCCESS] Whisper model ggml-small.en.bin downloaded."
     else
         echo "[ERROR] Failed to download Whisper model. Please check 'external/whisper.cpp/models/'."
     fi
