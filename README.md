@@ -1,6 +1,6 @@
 # VoxFormat: Voice-Powered Document Creation and Formatting
 
-![VoxFormat Demo](assets/vox-gif.gif)
+![VoxFormat Demo](assets/voxformat_video.gif)
 
 
 VoxFormat is a command-line interface (CLI) application designed to streamline the process of digitizing handwritten notes or drafting documents through voice dictation. It allows users to speak their text, which is transcribed in real-time, and simultaneously apply formatting like bold and italics using simple voice commands. This tool aims to be a faster alternative to manual typing or potentially error-prone handwriting OCR, providing a direct path from spoken words to a structured digital document.
