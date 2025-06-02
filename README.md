@@ -1,5 +1,8 @@
 # VoxFormat: Voice-Powered Document Creation and Formatting
 
+![VoxFormat Demo](assets/vox-gif.gif)
+
+
 VoxFormat is a command-line interface (CLI) application designed to streamline the process of digitizing handwritten notes or drafting documents through voice dictation. It allows users to speak their text, which is transcribed in real-time, and simultaneously apply formatting like bold and italics using simple voice commands. This tool aims to be a faster alternative to manual typing or potentially error-prone handwriting OCR, providing a direct path from spoken words to a structured digital document.
 
 The application continuously listens to voice input, transcribes the speech, and parses specific voice cues (e.g., "format start bold," "format stop italic") to apply basic Markdown formatting to the output. The resulting document can then be automatically saved as a plain text file.
@@ -138,9 +141,5 @@ The application continuously listens to voice input, transcribes the speech, and
 *   **Improved Error Handling & User Feedback:** More comprehensive error messages and status updates.
 *   **Configuration File:** For settings like silence timeout, default model, etc.
 *   **Support for More Languages:** Whisper.cpp supports many languages; this could be exposed.
-
-## Demo
-
-![VoxFormat Demo](assets/vox-gif.gif)
 
 ---
